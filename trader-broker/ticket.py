@@ -5,7 +5,9 @@ This tool never talks to a broker and never places anything. It does its
 work around the one moment that matters, your yes:
 
   show      renders each proposed order as a plain-English ticket plus the
-            exact JSON Claude will send to Alpaca's place_stock_order tool.
+            exact calls Claude will make: moomoo's trading_order_place (or
+            sim_trade_input_order on paper) with "broker": "moomoo", Alpaca's
+            place_stock_order with "broker": "alpaca".
             A bracket order shows its stop-loss, take-profit and the max loss
             at the stop. An order is READY only if trader-risk passed THIS
             exact order today (matched by fingerprint) and nobody has decided
@@ -174,6 +176,94 @@ def tool_input(order):
         if k in order and order[k] is not None:
             out[k] = _str_num(order[k]) if k in STRING_FIELDS else order[k]
     return out
+
+
+MOOMOO_TYPES = {"market": "MARKET", "limit": "LIMIT", "stop": "STOP", "stop_limit": "STOP_LIMIT"}
+MOOMOO_TIF = {"day": "DAY", "gtc": "GTC", "ioc": "IOC"}
+MOOMOO_ACC = "<acc_id: the US margin account from account_authorized_trd_accs>"
+MOOMOO_SIM_ACC = "<acc_id: the US paper account from sim_trade_account_list>"
+MOOMOO_SIM_MARKET = "<market: that account's market_id from sim_trade_account_list>"
+
+
+def broker_of(cfg):
+    return str(cfg.get("broker", "moomoo")).lower()
+
+
+def _remark(order):
+    """INTRADAY:<setup> on an entry, INTRADAY:EXIT on a sell: moomoo keeps the
+    remark, so a day trade is told apart from a swing trade later."""
+    if str(order.get("side", "")).lower() == "sell":
+        return "INTRADAY:EXIT"
+    setup = str((order.get("plan") or {}).get("setup") or "trade")
+    return ("INTRADAY:" + setup)[:64]
+
+
+def moomoo_calls(order, paper):
+    """The moomoo connector calls this one order becomes, in order.
+
+    moomoo has no bracket and no OCO, and a resting take-profit sell would hold
+    the shares the stop needs. So a bracket becomes: the entry; then, once it
+    fills, a STOP sell (GTC) for the filled shares; the take-profit is watched
+    by trader-alerts, not left at the broker. moomoo paper trading takes limit
+    and market orders only, so on paper the stop is watched too."""
+    if order.get("notional") is not None:
+        raise TicketError("moomoo orders take a share count, not a dollar amount: size it to qty first")
+    typ = str(order.get("type", "market")).lower()
+    sym = str(order.get("symbol", "")).upper()
+    side = str(order.get("side", "")).upper()
+    qty = _str_num(order.get("qty"))
+    remark = _remark(order)
+    calls = []
+    if paper:
+        if typ not in ("market", "limit"):
+            raise TicketError("moomoo paper trading takes market and limit orders only, not %s" % typ)
+        args = {"acc_id": MOOMOO_SIM_ACC, "market": MOOMOO_SIM_MARKET, "symbol": sym,
+                "order_side": "<%s, from the tool's Side enum>" % side, "order_type": 3 if typ == "market" else 1,
+                "qty": qty, "order_trade_time_type": 1, "text": remark}
+        if typ == "limit":
+            args["price"] = _str_num(order.get("limit_price"))
+        calls.append({"step": "entry" if side == "BUY" else "order", "tool": "sim_trade_input_order",
+                      "when": "now", "args": args})
+        return calls
+    if typ not in MOOMOO_TYPES:
+        raise TicketError("no moomoo order type for %s" % typ)
+    tif = MOOMOO_TIF.get(str(order.get("time_in_force", "day")).lower())
+    if not tif:
+        raise TicketError("moomoo has no time in force %s (DAY, GTC, GTD, IOC)" % order.get("time_in_force"))
+    args = {"acc_id": MOOMOO_ACC, "code": "US." + sym, "side": side, "order_type": MOOMOO_TYPES[typ],
+            "qty": qty, "time_in_force": tif, "session": "RTH", "remark": remark}
+    if typ in ("limit", "stop_limit"):
+        args["price"] = _str_num(order.get("limit_price"))
+    if typ in ("stop", "stop_limit"):
+        args["aux_price"] = _str_num(order.get("stop_price"))
+    calls.append({"step": "entry" if side == "BUY" else "order", "tool": "trading_order_place",
+                  "when": "now", "args": args})
+    if is_bracket(order) and order.get("stop_loss_stop_price") is not None:
+        calls.append({"step": "stop-loss", "tool": "trading_order_place",
+                      "when": "as soon as the entry fills, for the shares that filled",
+                      "args": {"acc_id": MOOMOO_ACC, "code": "US." + sym, "side": "SELL", "order_type": "STOP",
+                               "qty": qty, "aux_price": _str_num(order["stop_loss_stop_price"]),
+                               "time_in_force": "GTC", "session": "RTH", "remark": "INTRADAY:STOP"}})
+    return calls
+
+
+def moomoo_notes(order, paper):
+    """What the user needs to know about how moomoo carries this order."""
+    if not is_bracket(order):
+        return []
+    tp = order.get("take_profit_limit_price")
+    sl = order.get("stop_loss_stop_price")
+    if paper:
+        return ["moomoo paper trading takes market and limit orders only: the stop-loss %s and the "
+                "take-profit %s are watched by trader-alerts, and a market sell closes it when one rings."
+                % (_p(sl), _p(tp))]
+    notes = ["moomoo has no bracket: the stop-loss goes in as its own STOP order, good until canceled, "
+             "the moment the entry fills, so a missed close is still protected."]
+    if tp is not None:
+        notes.append("The take-profit %s is watched by trader-alerts, not left at moomoo (a resting sell would "
+                      "hold the shares the stop needs). When it rings: cancel the stop, then sell." % _p(tp))
+    notes.append("Your yes covers this set for this one trade. Read each order back with account_orders_active.")
+    return notes
 
 
 def _money(v):
@@ -351,10 +441,11 @@ def kind_of(order, rv):
 
 def render(order, idx, total, cfg, risk, state, today):
     ready, label, rv = status_of(order, risk, state, today)
-    broker = str(cfg.get("broker", "alpaca")).lower()
+    broker = broker_of(cfg)
     paper = cfg.get("paper", True)
     acct = "PAPER account" if paper else "LIVE ACCOUNT, REAL MONEY"
-    lines = ["ORDER %d of %d, %s, %s" % (idx, total, acct, "Interactive Brokers" if broker == "ibkr" else "Alpaca")]
+    name = {"ibkr": "Interactive Brokers", "moomoo": "moomoo"}.get(broker, "Alpaca")
+    lines = ["ORDER %d of %d, %s, %s" % (idx, total, acct, name)]
     for part in plain_parts(order):
         lines.append("  " + part)
     if order.get("why"):
@@ -362,7 +453,15 @@ def render(order, idx, total, cfg, risk, state, today):
     lines.append("  " + label)
     for w in (rv or {}).get("warnings", []):
         lines.append("  note: " + w)
-    if broker == "ibkr":
+    if broker == "moomoo":
+        for c in moomoo_calls(order, paper):
+            lines.append("  %s: Claude will call %s%s with:" % (
+                c["step"], c["tool"], "" if c["when"] == "now" else " " + c["when"]))
+            for l in json.dumps(c["args"], indent=2).splitlines():
+                lines.append("    " + l)
+        for n in moomoo_notes(order, paper):
+            lines.append("  " + n)
+    elif broker == "ibkr":
         lines.append("  Claude drafts this with the Interactive Brokers connector. IBKR sends it to your")
         lines.append("  IBKR account, and it only goes to the market after you approve it there.")
     else:
@@ -382,11 +481,16 @@ def render(order, idx, total, cfg, risk, state, today):
 def ticket_json(order, idx, cfg, risk, state, today):
     ready, label, rv = status_of(order, risk, state, today)
     loss, stop = max_loss(order)
-    return {"index": idx, "ready": ready, "status": label, "plain": plain(order),
-            "fingerprint": fingerprint(order), "paper": bool(cfg.get("paper", True)),
-            "broker": cfg.get("broker", "alpaca"), "tool": "place_stock_order",
-            "tool_input": tool_input(order), "why": order.get("why", ""),
-            "bracket": is_bracket(order), "max_loss": loss, "stop": stop}
+    out = {"index": idx, "ready": ready, "status": label, "plain": plain(order),
+           "fingerprint": fingerprint(order), "paper": bool(cfg.get("paper", True)),
+           "broker": broker_of(cfg), "tool": "place_stock_order",
+           "tool_input": tool_input(order), "why": order.get("why", ""),
+           "bracket": is_bracket(order), "max_loss": loss, "stop": stop}
+    if broker_of(cfg) == "moomoo":
+        calls = moomoo_calls(order, bool(cfg.get("paper", True)))
+        out.update({"tool": calls[0]["tool"], "tool_input": calls[0]["args"], "calls": calls,
+                    "notes": moomoo_notes(order, bool(cfg.get("paper", True)))})
+    return out
 
 
 # ---------------------------------------------------------------- fills -> portfolio
@@ -512,11 +616,21 @@ def cmd_approve(a):
            "symbol": str(order.get("symbol", "")).upper(), "side": order.get("side"),
            "qty": order.get("qty"), "kind": kind_of(order, rv), "max_loss": loss, "stop": stop,
            "plain": plain(order), "status": "approved", "reply": a.reply,
-           "paper": bool(cfg.get("paper", True)), "broker": cfg.get("broker", "alpaca")}
+           "paper": bool(cfg.get("paper", True)), "broker": broker_of(cfg)}
     state.setdefault("orders", []).append(rec)
     write_json(a.state, state)
     print("Recorded your yes for order %d: %s." % (a.index, plain(order)))
-    if str(cfg.get("broker", "alpaca")).lower() == "ibkr":
+    if broker_of(cfg) == "moomoo":
+        paper = bool(cfg.get("paper", True))
+        for c in moomoo_calls(order, paper):
+            print("%s: call %s%s with:" % (c["step"], c["tool"], "" if c["when"] == "now" else " " + c["when"]))
+            print(json.dumps(c["args"], indent=2))
+        for n in moomoo_notes(order, paper):
+            print(n)
+        print("Fill in acc_id (and market on paper) from moomoo, then Claude's card shows Allow once / Deny. "
+              "Then: ticket.py result --index %d --status placed|denied|failed --broker-id <moomoo order_id>"
+              % a.index)
+    elif broker_of(cfg) == "ibkr":
         print("Now draft it with the Interactive Brokers connector; approve it in your IBKR account.")
     else:
         print("Now call place_stock_order with exactly:")
@@ -587,7 +701,9 @@ def cmd_flatten(a):
     cfg = read_json(a.config, "config", required=False) or {}
     sym = a.symbol.strip().upper()
     now, today = _clock(a)
-    source = "the broker, get_open_position"
+    moomoo = broker_of(cfg) == "moomoo"
+    pos_tool = "account_positions" if moomoo else "get_open_position"
+    source = "the broker, " + pos_tool
     if a.qty is not None:
         qty = _f(a.qty)
         if qty is None or qty <= 0:
@@ -598,8 +714,8 @@ def cmd_flatten(a):
                   if str(p.get("ticker") or p.get("symbol") or "").upper() == sym)
         source = a.portfolio
         if qty <= 1e-9:
-            raise TicketError("nothing to flatten: no %s shares in %s. Check the broker (get_open_position "
-                              "%s) and pass --qty if you do hold some" % (sym, a.portfolio, sym))
+            raise TicketError("nothing to flatten: no %s shares in %s. Check the broker (%s "
+                              "%s) and pass --qty if you do hold some" % (sym, a.portfolio, pos_tool, sym))
     plan = read_json(a.plan, "plan", required=False) or {}
     flat_by = (plan.get("flat_by") if str(plan.get("symbol", "")).upper() == sym else None) \
         or cfg.get("flat_by") or "15:55"
@@ -617,14 +733,19 @@ def cmd_flatten(a):
     print("Wrote it to %s%s." % (a.orders, (" (it replaced %d earlier proposal%s)"
                                              % (replaced, "" if replaced == 1 else "s")) if replaced else ""))
     if a.qty is None:
-        print("The qty comes from %s. Check it against get_open_position %s before you say yes." % (source, sym))
+        print("The qty comes from %s. Check it against %s %s before you say yes." % (source, pos_tool, sym))
     print("Next:")
     print("  1. trader-risk: check.py. A sell that only closes what you hold is never blocked by the daily")
     print("     limits or the entry window.")
     print("  2. ticket.py show, then the user's yes for this one order.")
-    print("  3. If the bracket's stop-loss and take-profit are still open, Alpaca holds these shares for them")
-    print("     and rejects a new sell. Cancel them first: get_orders (status open, nested true), then")
-    print("     cancel_order_by_id for each open leg (Needs approval). Then place_stock_order with the ticket.")
+    if moomoo:
+        print("  3. If the INTRADAY:STOP order is still open, it waits on these shares. Cancel it first:")
+        print("     account_orders_active (US) for its order_id, then trading_order_cancel with order_id and")
+        print("     exchange (Needs approval). Then the sell from the ticket, and read it back.")
+    else:
+        print("  3. If the bracket's stop-loss and take-profit are still open, Alpaca holds these shares for them")
+        print("     and rejects a new sell. Cancel them first: get_orders (status open, nested true), then")
+        print("     cancel_order_by_id for each open leg (Needs approval). Then place_stock_order with the ticket.")
     return 0
 
 

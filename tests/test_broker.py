@@ -280,6 +280,65 @@ class Flow(unittest.TestCase):
         self.assertIn("after you approve it there", text)
         self.assertNotIn("place_stock_order", text)
 
+    def set_cfg(self, **kw):
+        with open(self.cfg) as fh:
+            c = json.load(fh)
+        c.update(kw)
+        with open(self.cfg, "w") as fh:
+            json.dump(c, fh)
+
+    def test_moomoo_live_bracket_becomes_entry_then_gtc_stop(self):
+        self.set_cfg(broker="moomoo", paper=False)
+        self.run_risk()
+        code, text, _ = run(self.args("show", "--index", "1", "--json"))
+        self.assertEqual(code, 0)
+        t = json.loads(text)
+        self.assertEqual((t["broker"], t["tool"]), ("moomoo", "trading_order_place"))
+        entry, stop = t["calls"]
+        self.assertEqual({k: v for k, v in entry["args"].items() if k != "acc_id"},
+                         {"code": "US.TSLA", "side": "BUY", "order_type": "MARKET", "qty": "8",
+                          "time_in_force": "DAY", "session": "RTH", "remark": "INTRADAY:orb"})
+        self.assertEqual({k: v for k, v in stop["args"].items() if k != "acc_id"},
+                         {"code": "US.TSLA", "side": "SELL", "order_type": "STOP", "qty": "8",
+                          "aux_price": "358.32", "time_in_force": "GTC", "session": "RTH",
+                          "remark": "INTRADAY:STOP"})
+        self.assertIn("entry fills", stop["when"])
+        code, text, _ = run(self.args("show", "--index", "1"))
+        self.assertIn("LIVE ACCOUNT, REAL MONEY, moomoo", text)
+        self.assertIn("watched by trader-alerts", text)
+        self.assertNotIn("place_stock_order", text)
+        code, text, _ = run(self.args("approve", "--index", "1", "--reply", "yes"))
+        self.assertEqual(code, 0)
+        self.assertIn("call trading_order_place with", text)
+        self.assertIn('"aux_price": "358.32"', text)
+
+    def test_moomoo_paper_uses_sim_trading_and_watches_the_stop(self):
+        self.set_cfg(broker="moomoo", paper=True)
+        self.run_risk()
+        t = json.loads(run(self.args("show", "--index", "1", "--json"))[1])
+        self.assertEqual(t["tool"], "sim_trade_input_order")
+        self.assertEqual(len(t["calls"]), 1)
+        args = t["calls"][0]["args"]
+        self.assertEqual((args["symbol"], args["order_type"], args["qty"], args["text"]), ("TSLA", 3, "8", "INTRADAY:orb"))
+        self.assertIn("limit orders only", t["notes"][0])
+
+    def test_moomoo_flatten_cancels_the_stop_first(self):
+        self.set_cfg(broker="moomoo", paper=False)
+        code, text, _ = run(["flatten", "--symbol", "TSLA", "--qty", "8", "--orders", self.orders,
+                             "--portfolio", self.none, "--plan", self.none, "--config", self.cfg, "--now", NOW])
+        self.assertEqual(code, 0)
+        self.assertIn("trading_order_cancel", text)
+        self.assertNotIn("cancel_order_by_id", text)
+        with open(self.orders) as fh:
+            order = json.load(fh)["orders"][0]
+        call = ticket.moomoo_calls(order, False)[0]
+        self.assertEqual((call["args"]["side"], call["args"]["order_type"], call["args"]["remark"]),
+                         ("SELL", "MARKET", "INTRADAY:EXIT"))
+
+    def test_moomoo_refuses_a_dollar_amount(self):
+        with self.assertRaises(ticket.TicketError):
+            ticket.moomoo_calls(AAPL, False)
+
     def test_fill_sell_relieves_the_oldest_lot(self):
         pf = {"cash": 0, "positions": [{"ticker": "KO", "shares": 3, "lots": [
             {"id": "KO-1", "date": "2025-01-02", "shares": 2, "cost": 120.0},
